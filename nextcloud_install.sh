@@ -16,15 +16,15 @@ NC='\033[0m' # No Color
 
 # --- Function to print messages ---
 info() {
-    echo -e "${GREEN}[INFO] $1${NC}"
+    printf "${GREEN}[INFO] %s${NC}\n" "$1"
 }
 
 warn() {
-    echo -e "${YELLOW}[WARN] $1${NC}"
+    printf "${YELLOW}[WARN] %s${NC}\n" "$1"
 }
 
 error() {
-    echo -e "${RED}[ERROR] $1${NC}"
+    printf "${RED}[ERROR] %s${NC}\n" "$1"
     exit 1
 }
 
@@ -42,7 +42,7 @@ detect_distro() {
             APACHE_CONF_DIR="/etc/apache2/sites-available"
             APACHE_ENABLE_CMD="a2ensite"
             APACHE_DISABLE_CMD="a2dissite"
-            PHP_APACHE_PKG="libapache2-mod-php"
+            APACHE_TEST_CMD="apache2ctl configtest"
             LOG_DIR="\${APACHE_LOG_DIR}"
         elif [[ "$ID_LIKE" == *"fedora"* || "$ID_LIKE" == *"rhel"* || "$ID_LIKE" == *"centos"* ]]; then
             DISTRO="rhel"
@@ -53,7 +53,7 @@ detect_distro() {
             APACHE_CONF_DIR="/etc/httpd/conf.d"
             APACHE_ENABLE_CMD="true" # No-op, file in conf.d is auto-enabled
             APACHE_DISABLE_CMD="rm -f" # To disable, we remove the conf file
-            PHP_APACHE_PKG="php"
+            APACHE_TEST_CMD="httpd -t"
             LOG_DIR="/var/log/httpd"
         fi
     fi
@@ -80,16 +80,30 @@ install_dependencies() {
     systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1
 }
 
+# --- Function to restart Apache with syntax check ---
+restart_apache() {
+    info "Testing Apache configuration..."
+    APACHE_CONFIG_TEST_OUTPUT=$($APACHE_TEST_CMD 2>&1)
+    
+    if ! echo "$APACHE_CONFIG_TEST_OUTPUT" | grep -q "Syntax OK"; then
+        error "Apache configuration test failed:\n$APACHE_CONFIG_TEST_OUTPUT"
+    fi
+    info "Apache configuration syntax is OK."
+
+    info "Restarting Apache..."
+    systemctl restart $WEB_SERVER_SERVICE
+    if ! systemctl is-active --quiet $WEB_SERVER_SERVICE; then
+        error "Failed to restart Apache. Please check the logs using 'journalctl -xeu ${WEB_SERVER_SERVICE}'"
+    fi
+}
+
 # --- Function to clean up remote access configurations ---
 cleanup_remote_access() {
     info "Cleaning up previous remote access configurations..."
-    # Remove Cloudflare cron job
     (crontab -l 2>/dev/null | grep -v "/usr/local/bin/cloudflared tunnel") | crontab -
-    # Stop any running cloudflared process
     pkill -f cloudflared
     rm -rf /etc/cloudflared /usr/local/bin/cloudflared
 
-    # Remove DuckDNS cron job
     if crontab -l 2>/dev/null | grep -q "/opt/duckdns/duck.sh"; then
         (crontab -l | grep -v "/opt/duckdns/duck.sh") | crontab -
         rm -rf /opt/duckdns
@@ -114,18 +128,22 @@ cleanup_remote_access() {
             Dav off
         </IfModule>
     </Directory>
+    <IfModule mod_headers.c>
+        Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+    </IfModule>
     ErrorLog ${LOG_DIR}/error.log
     CustomLog ${LOG_DIR}/access.log combined
 </VirtualHost>
 EOF
     $APACHE_ENABLE_CMD nextcloud.conf >/dev/null 2>&1
-    systemctl restart $WEB_SERVER_SERVICE
+    restart_apache
     info "Cleanup complete."
 }
 
 # --- Function to set up remote access ---
 setup_remote_access() {
-    INSTALL_LOCATION=${1:-$DEFAULT_INSTALL_LOCATION}
+    SETUP_MODE=$1 # Can be "interactive" or "headless"
+    INSTALL_LOCATION=${2:-$DEFAULT_INSTALL_LOCATION}
     info "Now, let's make your Nextcloud instance accessible from the internet."
     read -p "Choose your preferred method (cloudflare/duckdns) [Default: cloudflare]: " ACCESS_METHOD
     ACCESS_METHOD=${ACCESS_METHOD:-cloudflare}
@@ -157,7 +175,6 @@ ingress:
   - service: http_status:404
 EOF
         else
-            # For random URL, we get the UUID from the tunnel list to form the name
             TUNNEL_UUID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
             if [ -z "$TUNNEL_UUID" ]; then error "Failed to find created tunnel UUID."; fi
             DOMAIN_NAME="${TUNNEL_UUID}.cfargotunnel.com"
@@ -170,7 +187,7 @@ EOF
         fi
 
         info "Setting up cron job for auto-starting the tunnel on boot..."
-        (crontab -l 2>/dev/null; echo "@reboot /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run ${TUNNEL_NAME} >/dev/null 2>&1") | crontab -
+        (crontab -l 2>/dev/null; echo "@reboot sleep 60 && /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run ${TUNNEL_NAME} >/dev/null 2>&1") | crontab -
         info "Cron job created. Starting tunnel in the background..."
         nohup /usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run "${TUNNEL_NAME}" >/dev/null 2>&1 &
         
@@ -198,7 +215,7 @@ EOF
         case "$PKG_MANAGER" in apt) apt install certbot python3-certbot-apache -y;; *) $PKG_MANAGER install certbot python3-certbot-apache -y;; esac
         sed -i "s/ServerName localhost/ServerName ${DOMAIN_NAME}/" "${APACHE_CONF_DIR}/nextcloud.conf"
         sed -i "/ServerAlias ${SERVER_IP}/d" "${APACHE_CONF_DIR}/nextcloud.conf"
-        systemctl restart $WEB_SERVER_SERVICE
+        restart_apache
         info "Requesting and installing Let's Encrypt certificate..."
         warn "This may fail if your domain is not yet pointing to this server's public IP or if port 80 is blocked."
         certbot --apache -n --agree-tos -d "$DOMAIN_NAME" -m "$LETSENCRYPT_EMAIL" --redirect
@@ -207,11 +224,13 @@ EOF
         error "Invalid selection. Exiting."
     fi
 
-    info "Finalizing Nextcloud configuration..."
-    sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set trusted_domains 2 --value="$DOMAIN_NAME"
-    sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set overwrite.cli.url --value="https://${DOMAIN_NAME}"
-    sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set overwriteprotocol --value="https"
-    systemctl restart $WEB_SERVER_SERVICE
+    if [ "$SETUP_MODE" = "interactive" ]; then
+        info "Finalizing Nextcloud configuration..."
+        sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set trusted_domains 2 --value="$DOMAIN_NAME"
+        sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set overwrite.cli.url --value="https://${DOMAIN_NAME}"
+        sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set overwriteprotocol --value="https"
+    fi
+    restart_apache
 }
 
 # --- Main Script Logic ---
@@ -226,16 +245,19 @@ sleep 2
 
 if [ -d "${DEFAULT_INSTALL_LOCATION}nextcloud" ]; then
     warn "A Nextcloud installation has been detected."
-    echo "Please choose an option:"; echo "  1) Reconfigure Remote Access (Cloudflare/DuckDNS)"; echo "  2) Perform a Full Reinstall (DESTRUCTIVE)"; echo "  3) Exit"
+    printf "Please choose an option:\n"
+    printf "  1) Reconfigure Remote Access (Cloudflare/DuckDNS)\n"
+    printf "  2) Perform a Full Reinstall (DESTRUCTIVE)\n"
+    printf "  3) Exit\n"
     read -p "Enter your choice [1-3]: " REINSTALL_CHOICE
     case $REINSTALL_CHOICE in
-        1) cleanup_remote_access; setup_remote_access;;
+        1) cleanup_remote_access; setup_remote_access "interactive";;
         2)
             info "Proceeding with FULL reinstallation..."
             systemctl stop $WEB_SERVER_SERVICE
             $APACHE_DISABLE_CMD 000-default.conf nextcloud.conf nextcloud-le-ssl.conf >/dev/null 2>&1
             rm -rf "${DEFAULT_INSTALL_LOCATION}nextcloud" "${APACHE_CONF_DIR}/nextcloud.conf" "${APACHE_CONF_DIR}/nextcloud-le-ssl.conf"
-            systemctl restart $WEB_SERVER_SERVICE
+            restart_apache
             info "Previous installation files removed."
             read -sp "Please enter the MariaDB root password to remove the database: " MARIADB_ROOT_PASS_REINSTALL; echo
             mysql -u root -p"${MARIADB_ROOT_PASS_REINSTALL}" -e "DROP DATABASE IF EXISTS nextcloud; DROP USER IF EXISTS 'nextclouduser'@'localhost'; FLUSH PRIVILEGES;"
@@ -261,7 +283,9 @@ while true; do
 done
 
 install_dependencies
+info "Ensuring services are running..."
 systemctl enable $WEB_SERVER_SERVICE && systemctl start $WEB_SERVER_SERVICE
+systemctl enable mariadb && systemctl start mariadb
 warn "Next, you will be prompted to run 'mysql_secure_installation'."
 read -p "Press [Enter] to continue..."
 mysql_secure_installation
@@ -303,9 +327,13 @@ cat > "${APACHE_CONF_DIR}/nextcloud.conf" <<EOF
         Require all granted
         AllowOverride All
         Options FollowSymLinks MultiViews
-        <IfModule mod_dav.c> Dav off </IfModule>
+        <IfModule mod_dav.c>
+            Dav off
+        </IfModule>
     </Directory>
-    <IfModule mod_headers.c> Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains" </IfModule>
+    <IfModule mod_headers.c>
+        Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+    </IfModule>
     ErrorLog ${LOG_DIR}/error.log
     CustomLog ${LOG_DIR}/access.log combined
 </VirtualHost>
@@ -313,26 +341,47 @@ EOF
 $APACHE_DISABLE_CMD 000-default.conf >/dev/null 2>&1
 $APACHE_ENABLE_CMD nextcloud.conf
 if [ "$DISTRO" = "debian" ]; then a2enmod rewrite headers env dir mime ssl; fi
-systemctl restart $WEB_SERVER_SERVICE
+restart_apache
 
 info "Initial installation is complete!"
-warn "To create your admin account, open a web browser and go to one of these URLs:"; echo "  - ${YELLOW}If on this server:${NC} http://localhost"; echo "  - ${YELLOW}From another computer on the same network:${NC} http://${SERVER_IP}"
-warn "Use the following database details:"; echo "  - User: ${YELLOW}${DB_USER}${NC}"; echo "  - Password: ${YELLOW}${DB_PASS}${NC}"; echo "  - Database: ${YELLOW}${DB_NAME}${NC}"; echo "  - Host: ${YELLOW}localhost${NC}"
-read -p "Press [Enter] to continue after you have completed the web-based setup..."
+warn "To create your admin account, open a web browser and go to one of these URLs:"
+printf "  - ${YELLOW}If on this server:${NC} http://localhost\n"
+printf "  - ${YELLOW}From another computer on the same network:${NC} http://%s\n" "$SERVER_IP"
+warn "Use the following database details:"
+printf "  - User: ${YELLOW}%s${NC}\n" "$DB_USER"
+printf "  - Password: ${YELLOW}%s${NC}\n" "$DB_PASS"
+printf "  - Database: ${YELLOW}%s${NC}\n" "$DB_NAME"
+printf "  - Host: ${YELLOW}localhost${NC}\n"
 
-info "Adding localhost and IP to trusted domains..."
-sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set trusted_domains 0 --value="localhost"
-sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set trusted_domains 1 --value="${SERVER_IP}"
-
-setup_remote_access "$INSTALL_LOCATION"
+read -p "Do you want to complete the web-based setup now? (Answering 'n' will set up remote access and exit). (y/n): " COMPLETE_NOW
+if [[ "$COMPLETE_NOW" =~ ^[Yy]$ ]]; then
+    info "Waiting for you to complete the web-based installation..."
+    while ! grep -q "'installed' => true," "${INSTALL_LOCATION}nextcloud/config/config.php" 2>/dev/null; do
+        warn "Nextcloud installation is not yet complete. Please finish the setup in your web browser."
+        read -p "Press [Enter] after completing the setup to check again..."
+    done
+    info "Nextcloud installation verified."
+    info "Adding localhost and IP to trusted domains..."
+    sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set trusted_domains 0 --value="localhost"
+    sudo -u $WEB_SERVER_USER php "${INSTALL_LOCATION}nextcloud/occ" config:system:set trusted_domains 1 --value="${SERVER_IP}"
+    setup_remote_access "interactive" "$INSTALL_LOCATION"
+else
+    setup_remote_access "headless" "$INSTALL_LOCATION"
+    warn "Remote access is configured. You can now complete the Nextcloud setup using your phone or another computer."
+    warn "IMPORTANT: After setup, log in as admin, go to Settings -> Administration -> Security & setup warnings, and add your domain to the trusted domains list to remove any security warnings."
+fi
 
 info "Configuration complete!"
 LOCAL_URL="http://${SERVER_IP}"
 if [ "$ACCESS_METHOD" = "duckdns" ]; then
-    warn "IMPORTANT STEPS FOR DUCKDNS USERS:"; echo "  1. ${YELLOW}Set a Static IP Address:${NC} Your server's IP (${SERVER_IP}) should be static."; echo "  2. ${YELLOW}Port Forwarding:${NC} Forward external ports 80 and 443 to your server's IP (${SERVER_IP})."
+    warn "IMPORTANT STEPS FOR DUCKDNS USERS:"
+    printf "  1. ${YELLOW}Set a Static IP Address:${NC} Your server's IP (%s) should be static.\n" "$SERVER_IP"
+    printf "  2. ${YELLOW}Port Forwarding:${NC} Forward external ports 80 and 443 to your server's IP (%s).\n" "$SERVER_IP"
     LOCAL_URL="https://${SERVER_IP}"
 fi
-info "Your Nextcloud instance is now accessible via the following URLs:"; echo "  - ${GREEN}Public (from any network):${NC} https://${DOMAIN_NAME}"; echo "  - ${GREEN}Local (from your network):${NC} ${LOCAL_URL}"
+info "Your Nextcloud instance is now accessible via the following URLs:"
+printf "  - ${GREEN}Public (from any network):${NC} https://%s\n" "$DOMAIN_NAME"
+printf "  - ${GREEN}Local (from your network):${NC} %s\n" "$LOCAL_URL"
 
 read -p "Would you like to reboot the system now? (y/n): " REBOOT_CHOICE
 if [[ "$REBOOT_CHOICE" =~ ^[Yy]$ ]]; then info "Rebooting now..."; reboot; else info "Script finished."; fi
